@@ -1,4 +1,19 @@
 <?jelly escape-by-default='true'?>
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form" xmlns:i="jelly:fmt">
     <st:include page="configure-entries.jelly" class="hudson.model.ListView"/>
+
+    <f:section title="${%UI Default Filters Setup}">
+        <f:entry title="${%Name Pattern}" help="${rootURL}/plugin/dynamic-search-view/help/help-defaultIncludeRegex.html">
+            <f:textbox name="defaultIncludeRegex" field="defaultIncludeRegex"/>               
+        </f:entry>
+        <j:if test="${it.hasJobFilterExtensions()}">
+            <j:invokeStatic var="allJobFilters" className="hudson.views.ViewJobFilter" method="all"/>
+            <f:block>
+                <f:hetero-list name="defaultJobFilters" hasHeader="true"
+                       descriptors="${allJobFilters}"
+                       items="${it.defaultJobFilters}"
+                       addCaption="${%Add Job Filter}" />
+            </f:block>
+        </j:if>
+    </f:section>
 </j:jelly>

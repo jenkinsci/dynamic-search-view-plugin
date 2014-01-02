@@ -32,18 +32,19 @@ import hudson.model.TopLevelItem;
 import hudson.model.View;
 import hudson.model.ViewDescriptor;
 import hudson.search.Search;
+import hudson.util.DescribableList;
 import hudson.util.FormValidation;
 import hudson.views.ViewJobFilter;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 import javax.servlet.ServletException;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 
@@ -57,19 +58,42 @@ import org.kohsuke.stapler.StaplerResponse;
  */
 public class SimpleSearchView extends ListView {
 
-    transient Map<String, JobsFilter> contextMap;
+    transient UserContextCache contextMap;
     
+    private String defaultIncludeRegex;
+    private DescribableList<ViewJobFilter, Descriptor<ViewJobFilter>> defaultJobFilters;
+
     @DataBoundConstructor
     public SimpleSearchView(String name) {
         super(name);
     } 
 
+    public String getDefaultIncludeRegex() {
+        return defaultIncludeRegex;
+    }
+
+    public DescribableList<ViewJobFilter, Descriptor<ViewJobFilter>> getDefaultJobFilters() {
+        return defaultJobFilters;
+    }
+
+    @Override
+    protected void submit(StaplerRequest req) throws ServletException, Descriptor.FormException, IOException {
+        super.submit(req); 
+        
+        // Handle default UI settings
+        if (defaultJobFilters == null) {
+            defaultJobFilters = new DescribableList<ViewJobFilter, Descriptor<ViewJobFilter>>(this);
+        }
+        defaultJobFilters.rebuildHetero(req, req.getSubmittedForm(), ViewJobFilter.all(), "defaultJobFilters");
+        defaultIncludeRegex = hudson.Util.fixEmpty(req.getParameter("defaultIncludeRegex").toString());
+    }
+         
     /**
      * Gets identifier of the current session.
      * @return Unique id of the current session.
      */
     public static String getSessionId() {
-        return Hudson.SESSION_HASH;
+        return Stapler.getCurrentRequest().getSession().getId(); 
     }
     
     @Override
@@ -82,18 +106,46 @@ public class SimpleSearchView extends ListView {
     }
     
     public JobsFilter getFilters() {
-        return hasConfiguredFilters() ? contextMap.get(getSessionId()) : new JobsFilter(this);
+        return hasConfiguredFilters() 
+                ? contextMap.get(getSessionId()).getFiltersConfig()
+                : getDefaultFilters();
+    }
+
+    /**
+     * Gets default search options for UI. 
+     * @since 0.2
+     */
+    public JobsFilter getDefaultFilters() {
+        return new JobsFilter(this, 
+                    defaultJobFilters.getAll(ViewJobFilter.class), 
+                    defaultIncludeRegex, null);
     }
     
     /**
-     * Cleans internal cache of JSON Objects.
+     * An override for future versions.
+     */
+    public boolean isAutomaticRefreshEnabled() {
+        return false;
+    }
+       
+    /**
+     * Checks that the auto-refresh is enabled for the page.
+     */
+    public boolean isAutoRefreshActive() {
+        return true;
+        //TODO: implement something cool
+       // Stapler.getCurrentResponse().get
+    }
+    
+    /**
+     * Cleans internal cache of JSON Objects for the session.
      * @todo Cleanup approach, replace for URL-based parameterization
      * @return sessionId
      */
     public String cleanCache() {
-        String sessionId = getSessionId();
-        if (contextMap.containsKey(sessionId)) {
-            contextMap.remove(sessionId);
+        final String sessionId = getSessionId();
+        if (hasConfiguredFilters()) {
+            contextMap.flush(sessionId);
         }
         
         //TODO: garbage collector       
@@ -105,39 +157,55 @@ public class SimpleSearchView extends ListView {
         // Handle filters from config
         List<TopLevelItem> res = super.getItems(); 
         
-        // Handle user-specified filter
-        if (hasConfiguredFilters()) {
-            JobsFilter filters = contextMap.get(getSessionId());
-            res = filters.doFilter(res, this);
-        }
-        return res;
+        // Handle user-specified filters
+        JobsFilter filters = getFilters();
+        return filters.doFilter(res, this);
     }
        
-    public void doSearchSubmit(StaplerRequest req, StaplerResponse rsp) throws IOException, UnsupportedEncodingException, ServletException, Descriptor.FormException {
+    public void doSearchSubmit(StaplerRequest req, StaplerResponse rsp) 
+            throws IOException, UnsupportedEncodingException, ServletException, 
+            Descriptor.FormException {
         Hudson.getInstance().checkPermission(View.READ);
-         
-        // Get filters
-        JobsFilter filter = new JobsFilter(req, this);
+        SearchAction action = SearchAction.fromRequest(req);
         
+        switch (action) {
+            case runSearchButton:
+                JobsFilter filter = new JobsFilter(req, this);
+                updateSearchCache(filter);
+                rsp.sendRedirect(".");
+                break;
+            case resetDefaultsButton:
+                updateSearchCache(getDefaultFilters());
+                rsp.sendRedirect(".");
+                break;
+            default:
+                throw new IOException("Action "+action+" is not supported");
+        } 
+     }
+    
+    public void updateSearchCache(JobsFilter filter) {
         // Put Context to the map
         if (contextMap==null) {
             synchronized(this) {
-                contextMap = new ConcurrentHashMap<String, JobsFilter>();
+                contextMap = new UserContextCache();
             }
         }
-        contextMap.put(getSessionId(), filter);
-        
-        // Redirect to the current page in order to reload list with filters
-        rsp.sendRedirect(".");
-      }
-    
+        contextMap.put(getSessionId(), new UserContext(filter));
+    }
+      
     @Extension
     public static final class DescriptorImpl extends ViewDescriptor {
+        
         @Override
         public String getDisplayName() {
             return Messages.SimpleSearchView_displayName();
         }      
-               
+        
+        public FormValidation doCheckDefaultIncludeRegex ( @QueryParameter String value ) 
+                throws IOException, ServletException, InterruptedException  {
+            return doCheckIncludeRegex(value);
+        }
+        
         /**
          * Checks if the include regular expression is valid.
          */
@@ -151,10 +219,29 @@ public class SimpleSearchView extends ListView {
                 }
             }
             return FormValidation.ok();
-        }
+        }     
     }
   
     public boolean hasUserJobFilterExtensions() {
         return !ViewJobFilter.all().isEmpty();
+    }
+    
+    /**
+     * Defines actions inside Search panel.
+     * @since 0.2
+     */
+    enum SearchAction {   
+        runSearchButton,
+        resetDefaultsButton;
+        
+        static SearchAction fromRequest(StaplerRequest req) throws IOException {
+            Map map = req.getParameterMap();
+            for (SearchAction val : SearchAction.values()) {
+                if (map.containsKey(val.toString())) {
+                    return val;
+                }
+            }
+            throw new IOException("Cannot find an action in the reqest");
+        }
     }
 }
